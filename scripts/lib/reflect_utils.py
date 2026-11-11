@@ -1516,9 +1516,19 @@ def detect_patterns(text: str) -> Tuple[Optional[str], str, float, str, int]:
 # committed. Anything secret-shaped is replaced before it is stored.
 #
 # The token shapes start from SECRET in mod/hooks/register.tsx, which uses
-# them to drop a prompt instead. Keep the two lists in step. Here the text is
-# kept and only the secret is replaced, because "the staging password is X,
-# use the vault" is still a correction worth reviewing without X.
+# them to drop a prompt instead. Here the text is kept and only the secret is
+# replaced, because "the staging password is X, use the vault" is still a
+# correction worth reviewing without X.
+#
+# Deliberate differences from the mod's list, so a change to one can be
+# weighed for the other:
+#   * Added here: URL passwords, Bearer/Basic auth, ASIA key ids, quoted
+#     values, labels with a suffix (AWS_SECRET_ACCESS_KEY), PGP key blocks,
+#     and the JWT signature segment.
+#   * Narrower here: the long-token rule needs a standalone run and skips git
+#     SHAs, UUIDs, sha256: digests and word-like names (_looks_like_token),
+#     because a redacted name ruins a learning, while the mod only drops a
+#     prompt it would otherwise send to a model.
 
 REDACTED = "[REDACTED]"
 
