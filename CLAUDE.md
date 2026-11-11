@@ -132,7 +132,7 @@ Session files are JSONL at `~/.claude/projects/[PROJECT_FOLDER]/`:
 ```json
 {
   "type": "auto|explicit|positive|guardrail",
-  "message": "user's original text",
+  "message": "user's original text, secrets replaced with [REDACTED]",
   "timestamp": "ISO8601",
   "project": "/path/to/project",
   "patterns": "matched pattern names",

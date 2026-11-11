@@ -1510,6 +1510,92 @@ def detect_patterns(text: str) -> Tuple[Optional[str], str, float, str, int]:
     return (None, "", 0.0, "correction", 90)
 
 
+# =============================================================================
+# Secret redaction
+# =============================================================================
+#
+# Queue items, backups and extracted session text are plain JSON under
+# ~/.claude, and /reflect can copy them into CLAUDE.md files that get
+# committed. Anything secret-shaped is replaced before it is stored.
+#
+# The token shapes mirror SECRET in mod/hooks/register.tsx, which uses them to
+# drop a prompt instead. Keep the two lists in step. Here the text is kept and
+# only the secret is replaced, because "the staging password is X, use the
+# vault" is still a correction worth reviewing without X.
+
+REDACTED = "[REDACTED]"
+
+# Each entry is (pattern, group to replace). Group 0 replaces the whole match;
+# a higher group keeps the label around the secret ("password: [REDACTED]").
+SECRET_PATTERNS: List[Tuple["re.Pattern[str]", int]] = [
+    # A PEM private key, through its END line (or to the end of the text).
+    (re.compile(
+        r"-----BEGIN ([A-Z ]*)PRIVATE KEY-----[\s\S]*?(?:-----END \1PRIVATE KEY-----|\Z)"
+    ), 0),
+    # Credentials in a URL: postgres://user:pass@host keeps the user and host.
+    (re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:([^\s@/]+)@", re.IGNORECASE), 1),
+    # A labelled secret: "password is x", "api_key=x", "токен: x".
+    (re.compile(
+        r"(?:password|passwd|passphrase|secret|token|api[ _-]?key|пароль|токен|ключ)"
+        r"\s*(?:\bis\b|:|=)\s*(\S{4,})",
+        re.IGNORECASE,
+    ), 1),
+    # Provider tokens: OpenAI/Anthropic/Stripe, GitHub, Slack, GitLab.
+    (re.compile(r"\b(?:sk|pk|rk|ghp|gho|ghs|github_pat|xox[abprs]|glpat)[-_][A-Za-z0-9_-]{8,}", re.IGNORECASE), 0),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), 0),  # AWS access key id
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"), 0),  # Google API key
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?"), 0),  # a JWT
+    # A long opaque token: 32+ letters and digits (both present), standing alone.
+    (re.compile(
+        r"(?<![A-Za-z0-9_-])"
+        r"(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{32,}"
+        r"(?![A-Za-z0-9_-])"
+    ), 0),
+]
+
+# Long identifiers that are routinely part of a real learning ("pin to commit
+# 3f2a..."): git SHAs and UUIDs. The long-token pattern leaves these alone.
+# Git prints SHAs in lowercase, so mixed-case hex is still treated as a token.
+_NOT_SECRET_RE = re.compile(
+    r"[0-9a-f]{40}"
+    r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Replace API keys, tokens, JWTs, private keys and URL passwords.
+
+    Returns the text unchanged when nothing secret-shaped is found, and
+    passes non-strings through untouched.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    for pattern, group in SECRET_PATTERNS:
+        def _replace(match: "re.Match[str]", group: int = group) -> str:
+            if group == 0:
+                if _NOT_SECRET_RE.fullmatch(match.group(0)):
+                    return match.group(0)
+                return REDACTED
+            start, end = match.span(group)
+            offset = match.start()
+            whole = match.group(0)
+            return whole[: start - offset] + REDACTED + whole[end - offset:]
+
+        text = pattern.sub(_replace, text)
+    return text
+
+
+def redact_queue_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Copy of the queue with each item's message redacted."""
+    redacted = []
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("message"), str):
+            item = dict(item, message=redact_secrets(item["message"]))
+        redacted.append(item)
+    return redacted
+
+
 def create_queue_item(
     message: str,
     item_type: str,
@@ -1519,10 +1605,10 @@ def create_queue_item(
     decay_days: int,
     project: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Create a properly formatted queue item."""
+    """Create a properly formatted queue item. Secrets in the message are redacted."""
     return {
         "type": item_type,
-        "message": message,
+        "message": redact_secrets(message),
         "timestamp": iso_timestamp(),
         "project": project or os.getcwd(),
         "patterns": patterns,
@@ -1576,7 +1662,7 @@ def extract_user_messages(session_file: Path, corrections_only: bool = False) ->
                 # Handle string content directly
                 if isinstance(content, str):
                     if content and _should_include_message(content):
-                        messages.append(content)
+                        messages.append(redact_secrets(content))
                 # Handle list of content items
                 elif isinstance(content, list):
                     for item in content:
@@ -1585,7 +1671,7 @@ def extract_user_messages(session_file: Path, corrections_only: bool = False) ->
                             if text:
                                 # Apply filters (same as bash script)
                                 if _should_include_message(text):
-                                    messages.append(text)
+                                    messages.append(redact_secrets(text))
     except IOError:
         return []
 
@@ -1714,7 +1800,7 @@ def extract_tool_rejections(session_file: Path) -> List[str]:
                         # Get the next line (bash uses getline)
                         lines = after_marker.strip().split("\n")
                         if lines and lines[0].strip():
-                            rejections.append(lines[0].strip())
+                            rejections.append(redact_secrets(lines[0].strip()))
 
     except IOError:
         return []
@@ -1860,7 +1946,9 @@ def extract_tool_errors(
 
                     errors.append({
                         "error_type": error_type,
-                        "content": tool_content[:500],  # Truncate long errors
+                        # Redact before truncating so a cut cannot split a secret
+                        # into a shape the patterns no longer recognise.
+                        "content": redact_secrets(tool_content)[:500],
                         "project": str(session_file.parent.name),
                         "timestamp": entry.get("timestamp", ""),
                         "suggested_guideline": suggested_guideline,
