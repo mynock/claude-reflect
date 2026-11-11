@@ -100,12 +100,16 @@ def queue_path_for_folder(project_folder: Path) -> Path:
 
 
 def load_queue_at(path: Path) -> List[Dict[str, Any]]:
-    """Read a queue from an explicit path. No migration, no encoding."""
+    """Read a queue from an explicit path. No migration, no encoding.
+
+    Secrets in messages are redacted, so queues written before redaction
+    existed are clean once read. Anything but a JSON list reads as empty.
+    """
     if not path.exists():
         return []
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-        return loaded if isinstance(loaded, list) else []
+        return redact_queue_items(loaded) if isinstance(loaded, list) else []
     except (ValueError, IOError, OSError):
         return []
 
@@ -117,11 +121,13 @@ def save_queue_at(path: Path, items: List[Dict[str, Any]]) -> None:
     between truncate and write sees an empty or half-written file -- which
     the loaders treat as "no learnings" and the migration used to treat as
     "safe to delete".
+
+    Secrets in messages are redacted on the way out.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
     try:
-        tmp.write_text(json.dumps(items, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(redact_queue_items(items), indent=2), encoding="utf-8")
         tmp.replace(path)
     finally:
         try:
@@ -184,10 +190,7 @@ def migrate_global_queue() -> None:
                 except (ValueError, IOError):
                     existing = []
             existing.extend(project_items)
-            project_queue_path.parent.mkdir(parents=True, exist_ok=True)
-            project_queue_path.write_text(
-                json.dumps(existing, indent=2), encoding="utf-8"
-            )
+            save_queue_at(project_queue_path, existing)
         except Exception:
             continue
 
@@ -1155,13 +1158,7 @@ def load_queue(project_dir: Optional[str] = None) -> List[Dict[str, Any]]:
     # Migrate a folder left behind by the pre-3.2 path encoder
     migrate_legacy_project_folder(project_dir)
 
-    path = get_queue_path(project_dir)
-    if not path.exists():
-        return []
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, IOError):
-        return []
+    return load_queue_at(get_queue_path(project_dir))
 
 
 def save_queue(items: List[Dict[str, Any]], project_dir: Optional[str] = None) -> None:
@@ -1510,6 +1507,160 @@ def detect_patterns(text: str) -> Tuple[Optional[str], str, float, str, int]:
     return (None, "", 0.0, "correction", 90)
 
 
+# =============================================================================
+# Secret redaction
+# =============================================================================
+#
+# Queue items, backups and extracted session text are plain JSON under
+# ~/.claude, and /reflect can copy them into CLAUDE.md files that get
+# committed. Anything secret-shaped is replaced before it is stored.
+#
+# The token shapes start from SECRET in mod/hooks/register.tsx, which uses
+# them to drop a prompt instead. Here the text is kept and only the secret is
+# replaced, because "the staging password is X, use the vault" is still a
+# correction worth reviewing without X.
+#
+# Deliberate differences from the mod's list, so a change to one can be
+# weighed for the other:
+#   * Added here: URL passwords, Bearer/Basic auth, ASIA key ids, quoted
+#     values, labels with a suffix (AWS_SECRET_ACCESS_KEY), PGP key blocks,
+#     and the JWT signature segment.
+#   * Narrower here: the long-token rule needs a standalone run and skips git
+#     SHAs, UUIDs, sha256: digests and word-like names (_looks_like_token),
+#     because a redacted name ruins a learning, while the mod only drops a
+#     prompt it would otherwise send to a model.
+
+REDACTED = "[REDACTED]"
+
+# A secret's label: "password", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY",
+# "api-key", "токен", optionally closed by a quote as in {"password": ...}.
+_SECRET_LABEL = (
+    r"(?:password|passwd|passphrase|secret|token|api[ _-]?key|access[ _-]?key"
+    r"|пароль|токен|ключ)(?:_[A-Za-z0-9]+)*[\"']?"
+)
+
+# Each entry is (pattern, keep_label). keep_label=False replaces the whole
+# match. keep_label=True replaces only the capturing group that matched, so
+# "password: [REDACTED]" keeps the label and the URL keeps its user and host.
+SECRET_PATTERNS: List[Tuple[Any, bool]] = [
+    # A PEM or PGP private key, through its END line (or to the end of the text).
+    (re.compile(
+        r"-----BEGIN ([A-Z ]*)PRIVATE KEY((?: BLOCK)?)-----[\s\S]*?"
+        r"(?:-----END \1PRIVATE KEY\2-----|\Z)"
+    ), False),
+    # Credentials in a URL: postgres://user:pass@host, redis://:pass@host.
+    (re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s:/@]*:([^\s@/]+)@", re.IGNORECASE), True),
+    # A labelled secret with a quoted value: password="a b", {"token": "x"}.
+    (re.compile(
+        _SECRET_LABEL + r"\s*[:=]\s*(?:\"([^\"\n]+)\"|'([^'\n]+)')",
+        re.IGNORECASE,
+    ), True),
+    # An assignment: API_KEY=x. Values without quotes have no spaces.
+    (re.compile(_SECRET_LABEL + r"\s*=\s*([^\s\"']\S*)", re.IGNORECASE), True),
+    # A colon label: "password: my long passphrase". The value runs to the end
+    # of the clause, so a passphrase with spaces is not cut after one word.
+    (re.compile(
+        _SECRET_LABEL + r"\s*:\s*([^\s\"'][^,;\n]*?)(?=\s*(?:[,;\n]|\Z))",
+        re.IGNORECASE,
+    ), True),
+    # Prose: "the password is hunter2".
+    (re.compile(_SECRET_LABEL + r"\s+is\s+(\S{4,})", re.IGNORECASE), True),
+    # HTTP auth: "Authorization: Bearer x", "Basic dXNlcjpwYXNz".
+    (re.compile(r"\b(?:Bearer|Basic)\s+([A-Za-z0-9._~+/=-]{8,})"), True),
+    # Provider tokens: OpenAI/Anthropic/Stripe, GitHub, Slack, GitLab.
+    (re.compile(r"\b(?:sk|pk|rk|ghp|gho|ghs|github_pat|xox[abprs]|glpat)[-_][A-Za-z0-9_-]{8,}", re.IGNORECASE), False),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), False),  # AWS access key id (long-lived, temporary)
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"), False),  # Google API key
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?"), False),  # a JWT
+]
+
+# A long opaque token standing alone: 32+ characters from the base64url set,
+# letters and digits both present. Whether it is really a token is decided by
+# _looks_like_token(), so ordinary long names survive.
+_LONG_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{32,}"
+    r"(?![A-Za-z0-9_-])"
+)
+_HEX_RE = re.compile(r"[0-9a-fA-F]+")
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")  # git prints SHAs in lowercase
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_DIGEST_PREFIX_RE = re.compile(r"(?:sha(?:1|224|256|384|512))[:=]$", re.IGNORECASE)
+
+
+def _char_class(c: str) -> int:
+    if c.islower():
+        return 0
+    if c.isupper():
+        return 1
+    if c.isdigit():
+        return 2
+    return 3
+
+
+def _looks_like_token(run: str, preceding: str) -> bool:
+    """Tell a random token from a long name like 0042_auto_20240101_add_users.
+
+    Random base64 switches between lowercase, uppercase, digits and symbols at
+    roughly 60% of positions; names made of words switch at about 30%, once
+    per word. Pure hex is always treated as a token, except a lowercase git
+    SHA or a digest written as sha256:<hex>.
+    """
+    if _GIT_SHA_RE.fullmatch(run) or _UUID_RE.fullmatch(run):
+        return False
+    if _HEX_RE.fullmatch(run):
+        return not _DIGEST_PREFIX_RE.search(preceding)
+    switches = sum(
+        1 for a, b in zip(run, run[1:]) if _char_class(a) != _char_class(b)
+    )
+    return switches >= 0.4 * (len(run) - 1)
+
+
+def redact_secrets(text: str) -> str:
+    """Replace API keys, tokens, JWTs, private keys and URL passwords.
+
+    Returns the text unchanged when nothing secret-shaped is found, and
+    passes non-strings through untouched.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    def _replace_group(match: Any) -> str:
+        # The one capturing group that matched holds the secret.
+        group = match.lastindex
+        start, end = match.span(group)
+        offset = match.start()
+        whole = match.group(0)
+        return whole[: start - offset] + REDACTED + whole[end - offset:]
+
+    for pattern, keep_label in SECRET_PATTERNS:
+        if keep_label:
+            text = pattern.sub(_replace_group, text)
+        else:
+            text = pattern.sub(REDACTED, text)
+
+    def _replace_long(match: Any) -> str:
+        preceding = match.string[max(0, match.start() - 8):match.start()]
+        return REDACTED if _looks_like_token(match.group(0), preceding) else match.group(0)
+
+    return _LONG_TOKEN_RE.sub(_replace_long, text)
+
+
+def redact_queue_items(items: Any) -> Any:
+    """Copy of the queue with each item's message redacted.
+
+    Anything that is not a list is returned as is.
+    """
+    if not isinstance(items, list):
+        return items
+    redacted = []
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("message"), str):
+            item = dict(item, message=redact_secrets(item["message"]))
+        redacted.append(item)
+    return redacted
+
+
 def create_queue_item(
     message: str,
     item_type: str,
@@ -1519,10 +1670,10 @@ def create_queue_item(
     decay_days: int,
     project: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Create a properly formatted queue item."""
+    """Create a properly formatted queue item. Secrets in the message are redacted."""
     return {
         "type": item_type,
-        "message": message,
+        "message": redact_secrets(message),
         "timestamp": iso_timestamp(),
         "project": project or os.getcwd(),
         "patterns": patterns,
@@ -1598,7 +1749,8 @@ def extract_user_messages(session_file: Path, corrections_only: bool = False) ->
         )
         messages = [m for m in messages if re.search(correction_pattern, m, re.IGNORECASE)]
 
-    return messages
+    # Redact only what is returned: most messages are dropped by the filter.
+    return [redact_secrets(m) for m in messages]
 
 
 def should_include_message(text: str) -> bool:
@@ -1714,7 +1866,7 @@ def extract_tool_rejections(session_file: Path) -> List[str]:
                         # Get the next line (bash uses getline)
                         lines = after_marker.strip().split("\n")
                         if lines and lines[0].strip():
-                            rejections.append(lines[0].strip())
+                            rejections.append(redact_secrets(lines[0].strip()))
 
     except IOError:
         return []
@@ -1860,7 +2012,9 @@ def extract_tool_errors(
 
                     errors.append({
                         "error_type": error_type,
-                        "content": tool_content[:500],  # Truncate long errors
+                        # Redact before truncating so a cut cannot split a secret
+                        # into a shape the patterns no longer recognise.
+                        "content": redact_secrets(tool_content)[:500],
                         "project": str(session_file.parent.name),
                         "timestamp": entry.get("timestamp", ""),
                         "suggested_guideline": suggested_guideline,

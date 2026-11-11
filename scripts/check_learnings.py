@@ -5,6 +5,7 @@ Cross-platform compatible (Windows, macOS, Linux).
 This script is called by Claude Code's PreCompact hook to back up
 the learnings queue before context is compacted.
 """
+import json
 import sys
 import os
 
@@ -12,7 +13,6 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.reflect_utils import (
-    get_queue_path,
     get_backup_dir,
     load_queue,
     backup_timestamp,
@@ -27,18 +27,15 @@ def main() -> int:
     if not items:
         return 0
 
-    queue_path = get_queue_path()
-
     # Create backup directory if needed
     backup_dir = get_backup_dir()
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save backup with timestamp
+    # Save backup with timestamp. Written from the loaded items rather than a
+    # raw copy: load_queue() redacts secrets, so a queue saved before
+    # redaction existed is backed up clean.
     backup_file = backup_dir / f"pre-compact-{backup_timestamp()}.json"
-    backup_file.write_text(
-        queue_path.read_text(encoding="utf-8") if queue_path.exists() else "[]",
-        encoding="utf-8",
-    )
+    backup_file.write_text(json.dumps(items, indent=2), encoding="utf-8")
 
     # Output informational message (non-blocking)
     print()
