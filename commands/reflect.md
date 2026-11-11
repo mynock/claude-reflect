@@ -537,7 +537,13 @@ another folder.
 
 **0.5b. Extract corrections from session files:**
 
-Session files are JSONL. Use jq to extract user messages, then grep for patterns.
+Session files are JSONL. Extract user messages with the bundled script, then grep its output for patterns:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/extract_session_learnings.py" <session-file>
+```
+
+The script drops `isMeta` entries and system content, and replaces API keys, tokens, passwords and private keys with `[REDACTED]`. **Do not read session files directly with Read, Grep or jq.** Raw transcripts can hold credentials, and anything extracted here can end up in a committed file.
 
 **CRITICAL**: Filter out command expansion messages using `isMeta != true`. Command expansions (like /reflect itself) are stored with `isMeta: true` and contain documentation text that would cause false positives.
 
@@ -553,7 +559,11 @@ Generate appropriate patterns for the detected language and combine with English
 
 **Default English patterns:** `remember:`, `no, use`, `don't use`, `actually`, `stop using`, `never use`, `that's wrong`, `I meant`, `use X not Y`
 
-For each `.jsonl` file in the project folder, extract user messages that match correction patterns. Use your judgment on the best extraction method - you can use Read, Grep, Bash with jq, or any combination that works.
+For each `.jsonl` file in the project folder, extract user messages that match correction patterns from the script output above. For tool rejections, use:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/extract_tool_rejections.py" <session-file>
+```
 
 **What to extract:**
 1. **User messages** with correction patterns (from `type: "user"` entries with `isMeta != true`)
@@ -883,14 +893,14 @@ Agent files (`agent-*.jsonl`) are sub-conversations; focus on main session files
 
 **2b. Extract tool rejections (HIGH confidence corrections):**
 
-Search the current session file for `toolUseResult` fields containing "user said:" followed by feedback. These are high-confidence corrections.
+Extract them from the current session file with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/extract_tool_rejections.py" <session-file>`, which also redacts secrets. These are high-confidence corrections.
 
 - "user said:" followed by empty content = rejection without feedback, skip these
 - Extract the feedback text after "user said:" for processing
 
 **2c. Extract user messages with correction patterns:**
 
-Search the current session file for user messages matching correction patterns. Use the same patterns from Step 0.5b. Remember:
+Search the output of `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/extract_session_learnings.py" <session-file>` for user messages matching correction patterns. Use the same patterns from Step 0.5b, and don't read the session file directly. Remember:
 - Filter out `isMeta: true` entries (command expansions like /reflect itself)
 - Apply language-specific patterns if conversation is non-English
 
@@ -1309,6 +1319,14 @@ Skipped: [N] learnings (including [M] from other projects)
 ### Step 7: Apply Changes
 
 Only after final confirmation:
+
+**Never write a secret.** Before writing, pass every entry through the redactor and write what it prints:
+
+```bash
+printf '%s\n' "<entry text>" | python3 "${CLAUDE_PLUGIN_ROOT}/scripts/redact.py"
+```
+
+If an entry still names a credential after that, replace the value with `[REDACTED]` or drop the entry and tell the user why.
 
 **7a. Apply to CLAUDE.md (Primary Targets):**
 1. Read current CLAUDE.md files

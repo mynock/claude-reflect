@@ -23,8 +23,10 @@ from lib.reflect_utils import (  # noqa: E402
     extract_tool_errors,
     extract_tool_rejections,
     extract_user_messages,
+    load_queue_at,
     redact_queue_items,
     redact_secrets,
+    save_queue_at,
 )
 
 PEM_BEGIN = "-----BEGIN " + "RSA PRIVATE KEY-----"
@@ -66,7 +68,7 @@ class TestRedactSecrets(unittest.TestCase):
 
     def test_keeps_the_correction_around_the_secret(self):
         out = redact_secrets("no, the staging password: hunter2 lives in vault, use that")
-        self.assertEqual(out, "no, the staging password: [REDACTED] lives in vault, use that")
+        self.assertEqual(out, "no, the staging password: [REDACTED], use that")
 
     def test_api_key_assignment(self):
         out = self.assertRedacted("remember: API_KEY=" + GITHUB_TOKEN, GITHUB_TOKEN)
@@ -108,6 +110,67 @@ class TestRedactSecrets(unittest.TestCase):
     def test_private_key_without_end_line(self):
         out = redact_secrets("key: " + PEM_BEGIN + "\nMIIBfakefake")
         self.assertNotIn("MIIBfake", out)
+
+    def test_aws_secret_access_key_and_temporary_key_id(self):
+        aws_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        out = self.assertRedacted("AWS_SECRET_ACCESS_KEY=" + aws_secret, aws_secret)
+        self.assertEqual(out, "AWS_SECRET_ACCESS_KEY=[REDACTED]")
+        self.assertRedacted("use ASIAIOSFODNN7EXAMPLE for the session", "ASIAIOSFODNN7EXAMPLE")
+
+    def test_quoted_json_and_config_values(self):
+        self.assertEqual(
+            redact_secrets('{"password": "hunter2", "user": "bob"}'),
+            '{"password": "[REDACTED]", "user": "bob"}',
+        )
+        self.assertEqual(
+            redact_secrets("DB_PASSWORD='correct horse battery'"),
+            "DB_PASSWORD='[REDACTED]'",
+        )
+
+    def test_passphrase_with_spaces(self):
+        self.assertEqual(
+            redact_secrets("password: my long passphrase"),
+            "password: [REDACTED]",
+        )
+
+    def test_url_password_with_empty_user(self):
+        self.assertEqual(
+            redact_secrets("use redis://:hunter2pw@cache:6379 not localhost"),
+            "use redis://:[REDACTED]@cache:6379 not localhost",
+        )
+
+    def test_bearer_and_basic_auth(self):
+        for text, secret in [
+            ("Authorization: Bearer abc123def456ghi", "abc123def456ghi"),
+            ("curl -H 'Authorization: Basic dXNlcjpwYXNzd29yZA=='", "dXNlcjpwYXNzd29yZA=="),
+        ]:
+            with self.subTest(text=text):
+                out = self.assertRedacted(text, secret)
+                self.assertIn("Authorization:", out)
+
+    def test_pgp_private_key_block(self):
+        begin = "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----"
+        end = "-----END PGP " + "PRIVATE KEY BLOCK-----"
+        out = redact_secrets("key\n" + begin + "\nlQOYBfake\n" + end + "\nok")
+        self.assertNotIn("lQOYBfake", out)
+        self.assertTrue(out.endswith("\nok"))
+
+    def test_long_names_are_not_tokens(self):
+        for text in [
+            "dont edit 0042_auto_20240101_add_column_to_users",
+            "call handleOAuth2CallbackForGoogleProviderNow instead",
+            "set max_tokens: 4096",
+            "the tokenizer: tiktoken",
+            "test_capture_hook_stores_and_prints_redacted_v2 is flaky",
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(redact_secrets(text), text)
+
+    def test_digest_with_prefix_kept_bare_hex_redacted(self):
+        digest = "ab12" * 16  # 64 hex characters
+        kept = "pin the image to sha256:" + digest
+        self.assertEqual(redact_secrets(kept), kept)
+        self.assertRedacted("the key is " + digest, digest)
 
     def test_long_opaque_token(self):
         for token in [LONG_TOKEN, "Zq9" * 12]:
@@ -230,13 +293,54 @@ class TestRedactionAtStorage(unittest.TestCase):
         self.assertNotIn("sk-ant-abcdefghijklmnop", queue_text)
         self.assertNotIn("sk-ant-abcdefghijklmnop", result.stdout)
 
+    def test_load_queue_at_redacts_a_queue_saved_before_redaction(self):
+        queue = self.temp_dir / "learnings-queue.json"
+        queue.write_text(json.dumps([
+            {"type": "explicit", "message": "remember: API_KEY=" + GITHUB_TOKEN},
+        ]), encoding="utf-8")
+        items = load_queue_at(queue)
+        self.assertEqual(items[0]["message"], "remember: API_KEY=[REDACTED]")
+
+    def test_load_queue_at_rejects_non_list(self):
+        queue = self.temp_dir / "learnings-queue.json"
+        queue.write_text(json.dumps({"message": "not a queue"}), encoding="utf-8")
+        self.assertEqual(load_queue_at(queue), [])
+
+    def test_save_queue_at_redacts(self):
+        queue = self.temp_dir / "learnings-queue.json"
+        save_queue_at(queue, [{"type": "auto", "message": "password: hunter2"}])
+        self.assertNotIn("hunter2", queue.read_text(encoding="utf-8"))
+
+    def test_corrections_only_filter_still_applies(self):
+        session = self._write_session([
+            {"type": "user", "message": {"content": "no, use token = " + GITHUB_TOKEN}},
+            {"type": "user", "message": {"content": "looks good, ship it"}},
+        ])
+        self.assertEqual(
+            extract_user_messages(session, corrections_only=True),
+            ["no, use token = [REDACTED]"],
+        )
+
+    def test_redact_cli(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "redact.py")],
+            input="use postgres://app:s3cretpw@db/app\n",
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "use postgres://app:[REDACTED]@db/app\n")
+
     def test_precompact_backup_redacts_old_queue(self):
         import check_learnings
 
         # A queue written before redaction existed still holds the raw text.
-        old_queue = [{"type": "explicit", "message": "remember: password is hunter2"}]
+        queue = self.temp_dir / "learnings-queue.json"
+        queue.write_text(json.dumps([
+            {"type": "explicit", "message": "remember: password is hunter2"},
+        ]), encoding="utf-8")
         backup_dir = self.temp_dir / "learnings-backups"
-        with patch.object(check_learnings, "load_queue", return_value=old_queue), \
+        with patch.object(check_learnings, "load_queue", lambda: load_queue_at(queue)), \
              patch.object(check_learnings, "get_backup_dir", return_value=backup_dir), \
              patch.object(check_learnings, "ensure_utf8_io"), \
              patch("sys.stdout"):

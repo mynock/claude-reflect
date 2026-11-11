@@ -100,12 +100,16 @@ def queue_path_for_folder(project_folder: Path) -> Path:
 
 
 def load_queue_at(path: Path) -> List[Dict[str, Any]]:
-    """Read a queue from an explicit path. No migration, no encoding."""
+    """Read a queue from an explicit path. No migration, no encoding.
+
+    Secrets in messages are redacted, so queues written before redaction
+    existed are clean once read. Anything but a JSON list reads as empty.
+    """
     if not path.exists():
         return []
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-        return loaded if isinstance(loaded, list) else []
+        return redact_queue_items(loaded) if isinstance(loaded, list) else []
     except (ValueError, IOError, OSError):
         return []
 
@@ -117,11 +121,13 @@ def save_queue_at(path: Path, items: List[Dict[str, Any]]) -> None:
     between truncate and write sees an empty or half-written file -- which
     the loaders treat as "no learnings" and the migration used to treat as
     "safe to delete".
+
+    Secrets in messages are redacted on the way out.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
     try:
-        tmp.write_text(json.dumps(items, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(redact_queue_items(items), indent=2), encoding="utf-8")
         tmp.replace(path)
     finally:
         try:
@@ -184,10 +190,7 @@ def migrate_global_queue() -> None:
                 except (ValueError, IOError):
                     existing = []
             existing.extend(project_items)
-            project_queue_path.parent.mkdir(parents=True, exist_ok=True)
-            project_queue_path.write_text(
-                json.dumps(existing, indent=2), encoding="utf-8"
-            )
+            save_queue_at(project_queue_path, existing)
         except Exception:
             continue
 
@@ -1155,13 +1158,7 @@ def load_queue(project_dir: Optional[str] = None) -> List[Dict[str, Any]]:
     # Migrate a folder left behind by the pre-3.2 path encoder
     migrate_legacy_project_folder(project_dir)
 
-    path = get_queue_path(project_dir)
-    if not path.exists():
-        return []
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, IOError):
-        return []
+    return load_queue_at(get_queue_path(project_dir))
 
 
 def save_queue(items: List[Dict[str, Any]], project_dir: Optional[str] = None) -> None:
@@ -1518,48 +1515,95 @@ def detect_patterns(text: str) -> Tuple[Optional[str], str, float, str, int]:
 # ~/.claude, and /reflect can copy them into CLAUDE.md files that get
 # committed. Anything secret-shaped is replaced before it is stored.
 #
-# The token shapes mirror SECRET in mod/hooks/register.tsx, which uses them to
-# drop a prompt instead. Keep the two lists in step. Here the text is kept and
-# only the secret is replaced, because "the staging password is X, use the
-# vault" is still a correction worth reviewing without X.
+# The token shapes start from SECRET in mod/hooks/register.tsx, which uses
+# them to drop a prompt instead. Keep the two lists in step. Here the text is
+# kept and only the secret is replaced, because "the staging password is X,
+# use the vault" is still a correction worth reviewing without X.
 
 REDACTED = "[REDACTED]"
 
-# Each entry is (pattern, group to replace). Group 0 replaces the whole match;
-# a higher group keeps the label around the secret ("password: [REDACTED]").
-SECRET_PATTERNS: List[Tuple["re.Pattern[str]", int]] = [
-    # A PEM private key, through its END line (or to the end of the text).
+# A secret's label: "password", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY",
+# "api-key", "токен", optionally closed by a quote as in {"password": ...}.
+_SECRET_LABEL = (
+    r"(?:password|passwd|passphrase|secret|token|api[ _-]?key|access[ _-]?key"
+    r"|пароль|токен|ключ)(?:_[A-Za-z0-9]+)*[\"']?"
+)
+
+# Each entry is (pattern, keep_label). keep_label=False replaces the whole
+# match. keep_label=True replaces only the capturing group that matched, so
+# "password: [REDACTED]" keeps the label and the URL keeps its user and host.
+SECRET_PATTERNS: List[Tuple[Any, bool]] = [
+    # A PEM or PGP private key, through its END line (or to the end of the text).
     (re.compile(
-        r"-----BEGIN ([A-Z ]*)PRIVATE KEY-----[\s\S]*?(?:-----END \1PRIVATE KEY-----|\Z)"
-    ), 0),
-    # Credentials in a URL: postgres://user:pass@host keeps the user and host.
-    (re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:([^\s@/]+)@", re.IGNORECASE), 1),
-    # A labelled secret: "password is x", "api_key=x", "токен: x".
+        r"-----BEGIN ([A-Z ]*)PRIVATE KEY((?: BLOCK)?)-----[\s\S]*?"
+        r"(?:-----END \1PRIVATE KEY\2-----|\Z)"
+    ), False),
+    # Credentials in a URL: postgres://user:pass@host, redis://:pass@host.
+    (re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s:/@]*:([^\s@/]+)@", re.IGNORECASE), True),
+    # A labelled secret with a quoted value: password="a b", {"token": "x"}.
     (re.compile(
-        r"(?:password|passwd|passphrase|secret|token|api[ _-]?key|пароль|токен|ключ)"
-        r"\s*(?:\bis\b|:|=)\s*(\S{4,})",
+        _SECRET_LABEL + r"\s*[:=]\s*(?:\"([^\"\n]+)\"|'([^'\n]+)')",
         re.IGNORECASE,
-    ), 1),
-    # Provider tokens: OpenAI/Anthropic/Stripe, GitHub, Slack, GitLab.
-    (re.compile(r"\b(?:sk|pk|rk|ghp|gho|ghs|github_pat|xox[abprs]|glpat)[-_][A-Za-z0-9_-]{8,}", re.IGNORECASE), 0),
-    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), 0),  # AWS access key id
-    (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"), 0),  # Google API key
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?"), 0),  # a JWT
-    # A long opaque token: 32+ letters and digits (both present), standing alone.
+    ), True),
+    # An assignment: API_KEY=x. Values without quotes have no spaces.
+    (re.compile(_SECRET_LABEL + r"\s*=\s*([^\s\"']\S*)", re.IGNORECASE), True),
+    # A colon label: "password: my long passphrase". The value runs to the end
+    # of the clause, so a passphrase with spaces is not cut after one word.
     (re.compile(
-        r"(?<![A-Za-z0-9_-])"
-        r"(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{32,}"
-        r"(?![A-Za-z0-9_-])"
-    ), 0),
+        _SECRET_LABEL + r"\s*:\s*([^\s\"'][^,;\n]*?)(?=\s*(?:[,;\n]|\Z))",
+        re.IGNORECASE,
+    ), True),
+    # Prose: "the password is hunter2".
+    (re.compile(_SECRET_LABEL + r"\s+is\s+(\S{4,})", re.IGNORECASE), True),
+    # HTTP auth: "Authorization: Bearer x", "Basic dXNlcjpwYXNz".
+    (re.compile(r"\b(?:Bearer|Basic)\s+([A-Za-z0-9._~+/=-]{8,})"), True),
+    # Provider tokens: OpenAI/Anthropic/Stripe, GitHub, Slack, GitLab.
+    (re.compile(r"\b(?:sk|pk|rk|ghp|gho|ghs|github_pat|xox[abprs]|glpat)[-_][A-Za-z0-9_-]{8,}", re.IGNORECASE), False),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), False),  # AWS access key id (long-lived, temporary)
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"), False),  # Google API key
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?"), False),  # a JWT
 ]
 
-# Long identifiers that are routinely part of a real learning ("pin to commit
-# 3f2a..."): git SHAs and UUIDs. The long-token pattern leaves these alone.
-# Git prints SHAs in lowercase, so mixed-case hex is still treated as a token.
-_NOT_SECRET_RE = re.compile(
-    r"[0-9a-f]{40}"
-    r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# A long opaque token standing alone: 32+ characters from the base64url set,
+# letters and digits both present. Whether it is really a token is decided by
+# _looks_like_token(), so ordinary long names survive.
+_LONG_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{32,}"
+    r"(?![A-Za-z0-9_-])"
 )
+_HEX_RE = re.compile(r"[0-9a-fA-F]+")
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")  # git prints SHAs in lowercase
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_DIGEST_PREFIX_RE = re.compile(r"(?:sha(?:1|224|256|384|512))[:=]$", re.IGNORECASE)
+
+
+def _char_class(c: str) -> int:
+    if c.islower():
+        return 0
+    if c.isupper():
+        return 1
+    if c.isdigit():
+        return 2
+    return 3
+
+
+def _looks_like_token(run: str, preceding: str) -> bool:
+    """Tell a random token from a long name like 0042_auto_20240101_add_users.
+
+    Random base64 switches between lowercase, uppercase, digits and symbols at
+    roughly 60% of positions; names made of words switch at about 30%, once
+    per word. Pure hex is always treated as a token, except a lowercase git
+    SHA or a digest written as sha256:<hex>.
+    """
+    if _GIT_SHA_RE.fullmatch(run) or _UUID_RE.fullmatch(run):
+        return False
+    if _HEX_RE.fullmatch(run):
+        return not _DIGEST_PREFIX_RE.search(preceding)
+    switches = sum(
+        1 for a, b in zip(run, run[1:]) if _char_class(a) != _char_class(b)
+    )
+    return switches >= 0.4 * (len(run) - 1)
 
 
 def redact_secrets(text: str) -> str:
@@ -1571,23 +1615,34 @@ def redact_secrets(text: str) -> str:
     if not isinstance(text, str) or not text:
         return text
 
-    for pattern, group in SECRET_PATTERNS:
-        def _replace(match: "re.Match[str]", group: int = group) -> str:
-            if group == 0:
-                if _NOT_SECRET_RE.fullmatch(match.group(0)):
-                    return match.group(0)
-                return REDACTED
-            start, end = match.span(group)
-            offset = match.start()
-            whole = match.group(0)
-            return whole[: start - offset] + REDACTED + whole[end - offset:]
+    def _replace_group(match: Any) -> str:
+        # The one capturing group that matched holds the secret.
+        group = match.lastindex
+        start, end = match.span(group)
+        offset = match.start()
+        whole = match.group(0)
+        return whole[: start - offset] + REDACTED + whole[end - offset:]
 
-        text = pattern.sub(_replace, text)
-    return text
+    for pattern, keep_label in SECRET_PATTERNS:
+        if keep_label:
+            text = pattern.sub(_replace_group, text)
+        else:
+            text = pattern.sub(REDACTED, text)
+
+    def _replace_long(match: Any) -> str:
+        preceding = match.string[max(0, match.start() - 8):match.start()]
+        return REDACTED if _looks_like_token(match.group(0), preceding) else match.group(0)
+
+    return _LONG_TOKEN_RE.sub(_replace_long, text)
 
 
-def redact_queue_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Copy of the queue with each item's message redacted."""
+def redact_queue_items(items: Any) -> Any:
+    """Copy of the queue with each item's message redacted.
+
+    Anything that is not a list is returned as is.
+    """
+    if not isinstance(items, list):
+        return items
     redacted = []
     for item in items:
         if isinstance(item, dict) and isinstance(item.get("message"), str):
@@ -1662,7 +1717,7 @@ def extract_user_messages(session_file: Path, corrections_only: bool = False) ->
                 # Handle string content directly
                 if isinstance(content, str):
                     if content and _should_include_message(content):
-                        messages.append(redact_secrets(content))
+                        messages.append(content)
                 # Handle list of content items
                 elif isinstance(content, list):
                     for item in content:
@@ -1671,7 +1726,7 @@ def extract_user_messages(session_file: Path, corrections_only: bool = False) ->
                             if text:
                                 # Apply filters (same as bash script)
                                 if _should_include_message(text):
-                                    messages.append(redact_secrets(text))
+                                    messages.append(text)
     except IOError:
         return []
 
@@ -1684,7 +1739,8 @@ def extract_user_messages(session_file: Path, corrections_only: bool = False) ->
         )
         messages = [m for m in messages if re.search(correction_pattern, m, re.IGNORECASE)]
 
-    return messages
+    # Redact only what is returned: most messages are dropped by the filter.
+    return [redact_secrets(m) for m in messages]
 
 
 def should_include_message(text: str) -> bool:

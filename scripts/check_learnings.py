@@ -17,7 +17,6 @@ from lib.reflect_utils import (
     load_queue,
     backup_timestamp,
     ensure_utf8_io,
-    redact_queue_items,
 )
 
 
@@ -32,13 +31,11 @@ def main() -> int:
     backup_dir = get_backup_dir()
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save backup with timestamp. Written from the parsed items rather than a
-    # raw copy so that a queue saved before redaction existed is redacted too.
+    # Save backup with timestamp. Written from the loaded items rather than a
+    # raw copy: load_queue() redacts secrets, so a queue saved before
+    # redaction existed is backed up clean.
     backup_file = backup_dir / f"pre-compact-{backup_timestamp()}.json"
-    backup_file.write_text(
-        json.dumps(redact_queue_items(items), indent=2),
-        encoding="utf-8",
-    )
+    backup_file.write_text(json.dumps(items, indent=2), encoding="utf-8")
 
     # Output informational message (non-blocking)
     print()
